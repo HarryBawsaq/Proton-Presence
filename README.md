@@ -15,14 +15,23 @@ Rust toolchain.
 
 ### 1. Install
 
-Install Rust if you do not have it:
+Install Rust and git if you do not have them:
 
 ```bash
-sudo pacman -S --needed rust
+sudo pacman -S --needed rust git
 ```
 
-Then, from the directory containing this README, run the installer as your
-normal user (not with `sudo`):
+Download the source:
+
+```bash
+git clone https://github.com/HarryBawsaq/Proton-Presence.git
+```
+
+```bash
+cd Proton-Presence
+```
+
+Run the installer as your normal user (not with `sudo`):
 
 ```bash
 ./install.sh
