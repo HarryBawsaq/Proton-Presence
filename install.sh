@@ -6,6 +6,8 @@ cd "$(dirname "$(readlink -f "$0")")"
 
 unit=proton-presence.service
 bin_dir="$HOME/.local/bin"
+data_dir="$HOME/.local/share/proton-presence"
+helper=proton-presence-bridge.exe
 unit_dir="$HOME/.config/systemd/user"
 config_dir="$HOME/.config/proton-presence"
 
@@ -32,6 +34,18 @@ cargo build --release --locked
 
 echo "==> Installing $bin_dir/proton-presence"
 install -Dm755 target/release/proton-presence "$bin_dir/proton-presence"
+
+# The helper that runs inside a game's Wine prefix is a Windows program.
+# A prebuilt copy is in the repository; it is rebuilt from bridge/bridge.c
+# when a Windows cross-compiler is installed (pacman -S mingw-w64-gcc).
+if command -v x86_64-w64-mingw32-gcc >/dev/null; then
+    echo "==> Building the bridge helper from source"
+    bridge/build.sh
+else
+    echo "==> Using the prebuilt bridge helper"
+fi
+echo "==> Installing $data_dir/$helper"
+install -Dm644 "bridge/$helper" "$data_dir/$helper"
 
 echo "==> Installing $unit_dir/$unit"
 install -Dm644 "$unit" "$unit_dir/$unit"

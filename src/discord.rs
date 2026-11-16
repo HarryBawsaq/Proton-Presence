@@ -120,18 +120,25 @@ pub fn socket_candidates(dirs: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The first socket that accepts a connection, without a handshake.
-pub fn probe(dirs: &[PathBuf]) -> Option<PathBuf> {
+/// Connects to the first socket that accepts a connection, without a
+/// handshake.
+pub fn connect_any(dirs: &[PathBuf]) -> Option<(UnixStream, PathBuf)> {
     socket_candidates(dirs)
         .into_iter()
-        .find(|path| UnixStream::connect(path).is_ok())
+        .find_map(|path| Some((UnixStream::connect(&path).ok()?, path)))
+}
+
+/// The first socket that accepts a connection.
+pub fn probe(dirs: &[PathBuf]) -> Option<PathBuf> {
+    connect_any(dirs).map(|(_, path)| path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Activity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
-    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
     pub timestamps: Timestamps,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assets: Option<Assets>,
@@ -393,7 +400,7 @@ mod tests {
     fn set_activity_payload_has_the_documented_shape() {
         let activity = Activity {
             details: Some("ELDEN RING".into()),
-            state: "Playing via Proton".into(),
+            state: Some("In the Lands Between".into()),
             timestamps: Timestamps {
                 start: 1_700_000_000_000,
             },
@@ -407,7 +414,7 @@ mod tests {
                     "pid": 42,
                     "activity": {
                         "details": "ELDEN RING",
-                        "state": "Playing via Proton",
+                        "state": "In the Lands Between",
                         "timestamps": { "start": 1_700_000_000_000u64 },
                     },
                 },
@@ -483,7 +490,7 @@ mod tests {
 
         let activity = Activity {
             details: Some("Game".into()),
-            state: "Playing via Proton".into(),
+            state: None,
             timestamps: Timestamps { start: 5 },
             assets: None,
         };

@@ -1,6 +1,7 @@
 //! proton-presence: Discord Rich Presence for Steam games running through
 //! Proton. Runs as a systemd user service and polls `/proc` every 5 seconds.
 
+mod bridge;
 mod catalog;
 mod config;
 mod daemon;
@@ -40,8 +41,9 @@ Environment:
   RUST_LOG   Log level: error, warn, info (default), debug, trace
 
 Games are matched to Discord's own applications using Discord's public game
-list, downloaded with curl about once a week. A config file is optional:
-~/.config/proton-presence/config.toml
+list, downloaded with curl about once a week. Games that report in-game
+details get a small helper started in their Wine prefix to pass them on.
+A config file is optional: ~/.config/proton-presence/config.toml
 ";
 
 fn main() -> ExitCode {
@@ -81,7 +83,11 @@ fn run() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         POLL_INTERVAL.as_secs()
     );
-    let mut daemon = Daemon::new(paths, Box::new(catalog::curl_fetch));
+    let mut daemon = Daemon::new(
+        paths,
+        Box::new(catalog::curl_fetch),
+        Box::new(bridge::spawn_helper),
+    );
     loop {
         daemon.tick(Instant::now(), daemon::unix_ms());
         thread::sleep(POLL_INTERVAL);
@@ -166,6 +172,14 @@ fn status() -> Result<()> {
         println!("Client:   {}", describe_client(config, game));
     }
 
+    if paths.bridge_helper.is_file() {
+        println!("Details:  in-game details are passed on for games that report them");
+    } else {
+        println!(
+            "Details:  not passed on (no helper at {})",
+            paths.bridge_helper.display()
+        );
+    }
     if catalog::cache_path(&paths.cache_dir).exists() {
         println!("Games:    Discord's game list is downloaded");
     } else {

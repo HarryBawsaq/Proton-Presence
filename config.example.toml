@@ -7,6 +7,12 @@
 # it; then only the client IDs below are used.
 # discord_game_list = true
 
+# Some games report what you are doing in the game ("Playing as Belgium,
+# 1853"). A small helper started next to each Proton game passes that on
+# to Discord. Set to false to never start the helper; games then show
+# their name and play time only.
+# game_rich_presence = true
+
 # For games Discord does not know: the Application ID of a Discord
 # application of your own (https://discord.com/developers/applications).
 # Discord shows that application's name as "Playing <name>".
