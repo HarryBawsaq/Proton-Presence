@@ -7,7 +7,6 @@ cd "$(dirname "$(readlink -f "$0")")"
 unit=proton-presence.service
 bin_dir="$HOME/.local/bin"
 data_dir="$HOME/.local/share/proton-presence"
-helper=proton-presence-bridge.exe
 unit_dir="$HOME/.config/systemd/user"
 config_dir="$HOME/.config/proton-presence"
 
@@ -47,18 +46,6 @@ cargo build --release --locked
 echo "==> Installing $bin_dir/proton-presence"
 install -Dm755 target/release/proton-presence "$bin_dir/proton-presence"
 
-# The helper that runs inside a game's Wine prefix is a Windows program.
-# A prebuilt copy is in the repository; it is rebuilt from bridge/bridge.c
-# when a Windows cross-compiler (mingw-w64) is installed.
-if command -v x86_64-w64-mingw32-gcc >/dev/null; then
-    echo "==> Building the bridge helper from source"
-    bridge/build.sh
-else
-    echo "==> Using the prebuilt bridge helper"
-fi
-echo "==> Installing $data_dir/$helper"
-install -Dm644 "bridge/$helper" "$data_dir/$helper"
-
 echo "==> Installing $unit_dir/$unit"
 install -Dm644 "$unit" "$unit_dir/$unit"
 
@@ -74,6 +61,17 @@ systemctl --user daemon-reload
 systemctl --user enable "$unit"
 # restart rather than start, so a reinstall picks up the new binary
 systemctl --user restart "$unit"
+
+# Earlier versions started a helper program next to each game. It has been
+# removed; stop one that is still running and delete the installed copy.
+if pkill -u "$(id -u)" -f proton-presence-bridge.exe 2>/dev/null; then
+    echo "==> Stopped a helper left running by an earlier version"
+fi
+if [ -e "$data_dir/proton-presence-bridge.exe" ]; then
+    echo "==> Removing the helper installed by an earlier version"
+    rm -f "$data_dir/proton-presence-bridge.exe"
+    rmdir "$data_dir" 2>/dev/null || true
+fi
 
 echo
 "$bin_dir/proton-presence" status

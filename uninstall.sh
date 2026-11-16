@@ -18,7 +18,8 @@ echo "==> Removing $unit_file"
 rm -f "$unit_file"
 echo "==> Removing $binary"
 rm -f "$binary"
-echo "==> Removing the bridge helper"
+# Earlier versions installed a helper program here.
+pkill -u "$(id -u)" -f proton-presence-bridge.exe 2>/dev/null || true
 rm -f "$data_dir/proton-presence-bridge.exe"
 rmdir "$data_dir" 2>/dev/null || true
 echo "==> Removing the cached game list"

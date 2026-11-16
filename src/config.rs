@@ -5,7 +5,6 @@
 //!
 //! ```toml
 //! discord_game_list = true           # look games up in Discord's list
-//! game_rich_presence = true          # pass on what the game itself reports
 //! default_client_id = "123456789012345678"   # for games Discord lacks
 //!
 //! [games.1245620]                    # Steam app ID
@@ -25,9 +24,6 @@ use serde::Deserialize;
 pub struct Config {
     /// Whether to look games up in Discord's public game list.
     pub discord_game_list: bool,
-    /// Whether to start the bridge helper next to Proton games so their
-    /// own Rich Presence reaches Discord.
-    pub game_rich_presence: bool,
     pub default_client_id: Option<String>,
     pub games: HashMap<u64, GameConfig>,
 }
@@ -36,7 +32,6 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             discord_game_list: true,
-            game_rich_presence: true,
             default_client_id: None,
             games: HashMap::new(),
         }
@@ -80,7 +75,10 @@ enum RawId {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     discord_game_list: Option<bool>,
-    game_rich_presence: Option<bool>,
+    /// Belonged to a feature that was removed. Still accepted, and
+    /// ignored, so that a config file that sets it stays valid.
+    #[serde(rename = "game_rich_presence")]
+    _game_rich_presence: Option<bool>,
     default_client_id: Option<RawId>,
     #[serde(default)]
     games: HashMap<String, RawGame>,
@@ -129,7 +127,6 @@ impl Config {
         }
         Ok(Config {
             discord_game_list: raw.discord_game_list.unwrap_or(true),
-            game_rich_presence: raw.game_rich_presence.unwrap_or(true),
             default_client_id: client_id(raw.default_client_id, "default_client_id")?,
             games,
         })
@@ -273,12 +270,9 @@ client_id = 300
     }
 
     #[test]
-    fn game_rich_presence_can_be_switched_off() {
-        assert!(Config::default().game_rich_presence);
-        assert!(Config::parse("").unwrap().game_rich_presence);
-        let config = Config::parse("game_rich_presence = false\n").unwrap();
-        assert!(!config.game_rich_presence);
-        assert!(config.discord_game_list);
+    fn option_of_the_removed_details_feature_is_still_accepted() {
+        let config = Config::parse("game_rich_presence = false\ndefault_client_id = \"100\"\n");
+        assert_eq!(config.unwrap().default_client_id.as_deref(), Some("100"));
     }
 
     #[test]
