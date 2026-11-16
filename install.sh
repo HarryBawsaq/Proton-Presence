@@ -17,6 +17,10 @@ if ! command -v cargo >/dev/null; then
     echo "cargo not found. Install Rust first: sudo pacman -S --needed rust" >&2
     exit 1
 fi
+if ! command -v curl >/dev/null; then
+    echo "curl not found. Install it first: sudo pacman -S --needed curl" >&2
+    exit 1
+fi
 if ! systemctl --user show-environment >/dev/null 2>&1; then
     echo "Cannot reach the systemd user manager (systemctl --user)." >&2
     echo "Run this from your normal desktop login session." >&2
@@ -48,6 +52,7 @@ systemctl --user restart "$unit"
 echo
 "$bin_dir/proton-presence" status
 echo
-echo "Installed. The service starts at every login."
-echo "Next: put your Discord application ID in $config_dir/config.toml"
+echo "Installed. Nothing else to do: the service starts at every login and"
+echo "shows your Proton games in Discord."
+echo "Optional settings: $config_dir/config.toml"
 echo "Logs: journalctl --user -u proton-presence -f"

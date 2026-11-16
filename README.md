@@ -2,18 +2,20 @@
 
 Discord Rich Presence for Steam games running through Proton on Linux.
 
-Discord on Linux usually cannot tell which game is running inside Proton.
-proton-presence is a small background service that can: it finds the running
-Steam game, looks up its name, and tells Discord over its local socket. It
-starts at login, waits quietly while Discord is closed, and reconnects on its
-own when Discord starts or restarts.
+Discord on Linux usually cannot tell which game is running inside Proton, so
+a game like Victoria 3 never shows up on your profile. proton-presence is a
+small background service that fixes that. It finds the running Steam game,
+looks up Discord's own entry for it, and tells Discord, so your profile shows
+"Playing Victoria 3" with the game's icon and a timer.
 
-Written for CachyOS; it works on any distribution with systemd and a current
-Rust toolchain.
+Install it once and forget it. It starts at login, waits quietly while
+Discord is closed, and reconnects on its own when Discord starts or restarts.
+There is no Discord developer setup and nothing to configure.
+
+Written for CachyOS; it works on any distribution with systemd, curl and a
+current Rust toolchain.
 
 ## Setup (once)
-
-### 1. Install
 
 Install Rust and git if you do not have them:
 
@@ -37,61 +39,30 @@ Run the installer as your normal user (not with `sudo`):
 ./install.sh
 ```
 
-The installer builds the release binary, copies it to
+That is all. The installer builds the release binary, copies it to
 `~/.local/bin/proton-presence`, installs the systemd user unit to
-`~/.config/systemd/user/proton-presence.service`, creates
-`~/.config/proton-presence/config.toml` if it does not exist, and enables and
-starts the service. From then on it starts at every login.
+`~/.config/systemd/user/proton-presence.service`, and enables and starts the
+service. From then on it starts at every login.
 
-### 2. Create a Discord application
+### One-time steps in Discord
 
-Discord shows the *name of the application* as "Playing …", so you need at
-least one application of your own.
+None are required. You do not need to create a Discord application, and
+`config.toml` can stay as installed.
 
-1. Open <https://discord.com/developers/applications> and click
-   **New Application**.
-2. Name it what Discord should show for games without their own entry, for
-   example `Steam`.
-3. Copy the **Application ID** from the General Information page.
+Only if you want a game that Discord does not know to show up as well, create
+an application of your own and fill in `config.toml`; see
+[Optional configuration](#optional-configuration).
 
-### 3. Fill in config.toml
+### Check it
 
-Open `~/.config/proton-presence/config.toml` and paste the ID:
-
-```toml
-default_client_id = "123456789012345678"
-```
-
-That is all that is required. The service notices the change within five
-seconds; there is nothing to restart.
-
-To show a particular game under its own title and artwork, create another
-Discord application named after the game, upload an image under
-**Rich Presence → Art Assets**, and map it by Steam app ID (the number in the
-game's store URL):
-
-```toml
-default_client_id = "123456789012345678"
-
-[games.1245620]                      # ELDEN RING
-client_id = "234567890123456789"     # application named "ELDEN RING"
-large_image = "elden_ring"           # art asset key in that application
-
-[games.620]                          # Portal 2
-large_image = "portal2"              # art asset in the default application
-```
-
-Both keys are optional per game. Without `client_id` the game uses
-`default_client_id`; without `large_image` no artwork is sent.
-
-### 4. Check it
+Start Discord, launch a Proton game, then run:
 
 ```bash
 ~/.local/bin/proton-presence status
 ```
 
 This reports whether the service is running, whether Discord is reachable,
-and which game is detected.
+which game is detected, and which Discord application it will be shown under.
 
 ### Troubleshooting
 
@@ -121,22 +92,23 @@ To see what would be sent, without connecting to Discord:
 
 Common causes when nothing shows in Discord:
 
-- `default_client_id` is still empty. The log says so at startup.
 - **Settings → Activity Privacy → Share your detected activities with
   others** is off in Discord.
 - Vesktop: Rich Presence (arRPC) has to be enabled in the Vesktop settings.
-- The log says the handshake was rejected: the client ID is not a valid
-  Application ID.
+- The log says the game is not in Discord's game list. See
+  [Optional configuration](#optional-configuration).
+- The log says the game list cannot be downloaded. The service needs to
+  reach `discord.com` once; it retries every ten minutes.
 
 ## What Discord shows
 
+For a game Discord knows:
+
 | Field | Value |
 |---|---|
-| Title | The name of your Discord application |
-| Details | The game's name from Steam |
+| Title and icon | The game's own, from Discord |
 | State | `Playing via Proton` (`Playing on Steam` for a native Linux game) |
 | Elapsed time | Counted from when the game was first detected |
-| Large image | The `large_image` asset, if configured |
 
 The presence is cleared when the game exits.
 
@@ -151,6 +123,9 @@ The presence is cleared when the game exits.
   libraries listed in `libraryfolders.vdf`, for the native Steam client
   (`~/.steam/steam`, `~/.local/share/Steam`) and the Flatpak one
   (`~/.var/app/com.valvesoftware.Steam`).
+- **Matching.** Discord publishes the list of games it can detect, and each
+  entry names the game's Steam app ID. proton-presence uses that to find the
+  game's own Discord application.
 - **Discord.** It connects to `discord-ipc-0` … `discord-ipc-9` in
   `$XDG_RUNTIME_DIR`, and in the Flatpak Discord, Flatpak Vesktop and Snap
   Discord subdirectories. The IPC protocol is implemented in
@@ -160,14 +135,60 @@ The presence is cleared when the game exits.
   quits mid-game the connection is dropped and re-established the same way,
   keeping the original start time.
 
+### Network use
+
+The only network request is downloading Discord's public game list
+(`https://discord.com/api/v10/applications/detectable`, about 13 MB) with
+`curl`. That happens when a game starts and the cached copy is missing or
+older than a week. Nothing about you or your games is sent. The mapping is
+cached in `~/.cache/proton-presence/discord-games.json`.
+
+To switch this off, set `discord_game_list = false` in `config.toml`. Then
+only client IDs from the config are used.
+
+## Optional configuration
+
+`~/.config/proton-presence/config.toml` is re-read automatically when it
+changes. Everything in it is optional.
+
+```toml
+# Set to false to never download Discord's game list (default: true).
+discord_game_list = true
+
+# An application of your own, used for games Discord does not know.
+default_client_id = "123456789012345678"
+
+# Use an application of your own for one game, keyed by Steam app ID.
+[games.1245620]
+client_id = "234567890123456789"
+large_image = "elden_ring"
+```
+
+For each game the first of these that applies is used:
+
+1. `client_id` under `[games.<steam app id>]`
+2. The game's own application from Discord's game list
+3. `default_client_id`
+
+If none applies, the game is not shown and the log says why.
+
+To create an application of your own, open
+<https://discord.com/developers/applications>, click **New Application**, and
+copy its **Application ID**. Discord shows the application's name as
+"Playing …", and the game's name on the line below. `large_image` is the key
+of an image uploaded under **Rich Presence → Art Assets** in that
+application; it is ignored for Discord's own applications, which already
+have the game's icon.
+
 ## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-This stops and disables the service and removes the unit and the binary. Your
-config is kept; the script prints the command to delete it.
+This stops and disables the service and removes the unit, the binary and the
+cached game list. Your config is kept; the script prints the command to
+delete it.
 
 ## Development
 
@@ -179,13 +200,14 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-The tests use a temporary directory as a fake `/proc` and a fake Discord
-server on a Unix socket, so they never touch the real system.
+The tests use a temporary directory as a fake `/proc`, a fake Discord server
+on a Unix socket and a canned game list, so they never touch the real system
+or the network.
 
 ## Limitations
 
-- Non-Steam shortcuts have no app manifest, so they
-  are shown as `Steam app <id>`.
+- A game that is not in Discord's game list is only shown if you set
+  `default_client_id`.
+- Non-Steam shortcuts have no app manifest and are not in Discord's list, so
+  with `default_client_id` they are shown as `Steam app <id>`.
 - If two games run at once, the one detected first is shown until it exits.
-- Without a Discord application of your own nothing can be shown; Discord
-  has no anonymous client ID.

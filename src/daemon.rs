@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 
-use crate::config::Config;
+use crate::catalog::{Catalog, Fetcher, Lookup};
+use crate::config::{Config, Resolved, Source};
 use crate::detect::{self, RunningGame};
 use crate::discord::{self, Activity, Assets, ConnectError, Connection, Timestamps};
 use crate::steam;
@@ -58,6 +59,7 @@ pub struct Paths {
     pub home: PathBuf,
     pub socket_dirs: Vec<PathBuf>,
     pub config_path: PathBuf,
+    pub cache_dir: PathBuf,
 }
 
 impl Paths {
@@ -70,6 +72,7 @@ impl Paths {
             proc_root: PathBuf::from("/proc"),
             socket_dirs: discord::socket_dirs(&discord::runtime_dir()),
             config_path: home.join(".config/proton-presence/config.toml"),
+            cache_dir: home.join(".cache/proton-presence"),
             home,
         })
     }
@@ -84,6 +87,8 @@ pub struct Game {
     pub proton: bool,
     /// Unix time in milliseconds when the game was first detected.
     pub started_ms: u64,
+    /// The game's own Discord application, per Discord's game list.
+    pub official: Lookup,
 }
 
 impl Game {
@@ -95,6 +100,15 @@ impl Game {
                 .unwrap_or_else(|| format!("Steam app {}", running.app_id)),
             proton: running.proton,
             started_ms: now_ms,
+            official: Lookup::Unavailable,
+        }
+    }
+
+    /// The official application ID, once it has been looked up.
+    pub fn official_id(&self) -> Option<&str> {
+        match &self.official {
+            Lookup::Found(id) => Some(id),
+            Lookup::NotListed | Lookup::Unavailable => None,
         }
     }
 
@@ -107,20 +121,26 @@ impl Game {
     }
 }
 
-/// Scans for the game a fresh daemon would show right now.
+/// Scans for the game a fresh daemon would show right now. The official
+/// application comes from the cached game list only; nothing is downloaded.
 pub fn detect_game(paths: &Paths, now_ms: u64) -> Option<Game> {
     let games = detect::scan(&paths.proc_root);
-    detect::pick_active(&games, None).map(|g| Game::from_running(g, &paths.home, now_ms))
+    let mut game =
+        detect::pick_active(&games, None).map(|g| Game::from_running(g, &paths.home, now_ms))?;
+    game.official = crate::catalog::cached_lookup(&paths.cache_dir, game.app_id);
+    Some(game)
 }
 
-pub fn build_activity(game: &Game, large_image: Option<&str>) -> Activity {
-    let details: String = game.name.chars().take(MAX_DETAILS_CHARS).collect();
+pub fn build_activity(game: &Game, resolved: &Resolved) -> Activity {
+    let name: String = game.name.chars().take(MAX_DETAILS_CHARS).collect();
     Activity {
-        assets: large_image.map(|key| Assets {
+        assets: resolved.large_image.map(|key| Assets {
             large_image: key.to_string(),
-            large_text: details.clone(),
+            large_text: name.clone(),
         }),
-        details,
+        // Under the game's own application Discord already shows its
+        // title, so repeating it in the details line would be noise.
+        details: (resolved.source != Source::Official).then_some(name),
         state: game.state_line().to_string(),
         timestamps: Timestamps {
             start: game.started_ms,
@@ -147,14 +167,17 @@ pub struct Daemon {
     retry_at: Option<Instant>,
     /// Last connect failure that was logged, to log each cause once.
     last_failure: Option<String>,
-    /// App ID already warned about for having no client ID.
-    warned_unmapped: Option<u64>,
+    /// Last "cannot show this game" warning, to log each cause once.
+    last_warning: Option<String>,
+    catalog: Catalog,
     connect_attempts: u64,
 }
 
 impl Daemon {
-    pub fn new(paths: Paths) -> Daemon {
+    /// `fetch` downloads Discord's game list; see [`crate::catalog`].
+    pub fn new(paths: Paths, fetch: Fetcher) -> Daemon {
         let mut daemon = Daemon {
+            catalog: Catalog::new(&paths.cache_dir, fetch),
             paths,
             config: Config::default(),
             config_stamp: None,
@@ -164,7 +187,7 @@ impl Daemon {
             backoff: Backoff::new(BACKOFF_INITIAL, BACKOFF_MAX),
             retry_at: None,
             last_failure: None,
-            warned_unmapped: None,
+            last_warning: None,
             connect_attempts: 0,
         };
         daemon.config_stamp = daemon.config_stamp();
@@ -182,7 +205,7 @@ impl Daemon {
             self.load_config();
         }
         self.update_game(now_ms);
-        self.sync_presence(now);
+        self.sync_presence(now, now_ms);
     }
 
     fn config_stamp(&self) -> Option<(SystemTime, u64)> {
@@ -192,22 +215,14 @@ impl Daemon {
 
     fn load_config(&mut self) {
         match Config::load(&self.paths.config_path) {
-            Ok(config) => {
-                if config.default_client_id.is_none() {
-                    warn!(
-                        "No default_client_id in {}: games without their own mapping get no presence",
-                        self.paths.config_path.display()
-                    );
-                }
-                self.config = config;
-            }
+            Ok(config) => self.config = config,
             // Keep running on the previous settings; the file is re-read
             // as soon as it changes again.
             Err(e) => error!("Ignoring invalid config: {e:#}"),
         }
         // A fixed config should take effect on the next poll, not after
         // the current backoff delay.
-        self.warned_unmapped = None;
+        self.last_warning = None;
         self.last_failure = None;
         self.retry_at = None;
         self.backoff.reset();
@@ -236,27 +251,44 @@ impl Daemon {
         }
     }
 
-    fn sync_presence(&mut self, now: Instant) {
-        let Some(game) = &self.game else {
+    fn sync_presence(&mut self, now: Instant, now_ms: u64) {
+        let Some(game) = &mut self.game else {
             self.close_connection();
             return;
         };
-        let Some(resolved) = self.config.resolve(game.app_id) else {
-            if self.warned_unmapped != Some(game.app_id) {
-                warn!(
-                    "No Discord client ID for {} (app {}): set default_client_id or [games.{}] in {}",
-                    game.name,
-                    game.app_id,
-                    game.app_id,
-                    self.paths.config_path.display()
-                );
-                self.warned_unmapped = Some(game.app_id);
+        // Ask Discord's game list which application belongs to this game,
+        // unless the config already names one. Until the list has been
+        // downloaded this is retried, at the catalog's own pace.
+        let mapped = self
+            .config
+            .games
+            .get(&game.app_id)
+            .is_some_and(|g| g.client_id.is_some());
+        if self.config.discord_game_list && !mapped && game.official == Lookup::Unavailable {
+            game.official = self.catalog.lookup(game.app_id, now, now_ms);
+        }
+
+        let Some(resolved) = self.config.resolve(game.app_id, game.official_id()) else {
+            let config = self.paths.config_path.display();
+            let why = match (&game.official, self.config.discord_game_list) {
+                (Lookup::Unavailable, true) => "Discord's game list is not available yet".into(),
+                (_, true) => format!(
+                    "it is not in Discord's game list; to show it anyway, set default_client_id in {config}"
+                ),
+                (_, false) => format!(
+                    "discord_game_list is off and {config} has no client ID for it"
+                ),
+            };
+            let warning = format!("Cannot show {} (app {}): {why}", game.name, game.app_id);
+            if self.last_warning.as_deref() != Some(warning.as_str()) {
+                warn!("{warning}");
+                self.last_warning = Some(warning);
             }
             self.close_connection();
             return;
         };
         let client_id = resolved.client_id.to_string();
-        let desired = build_activity(game, resolved.large_image);
+        let desired = build_activity(game, &resolved);
 
         // The client ID is fixed at handshake time, so another game's
         // application needs a new connection.
@@ -315,7 +347,10 @@ impl Daemon {
             };
             match connection.set_activity(Some(&desired)) {
                 Ok(()) => {
-                    debug!("Presence set: {} / {}", desired.details, desired.state);
+                    debug!(
+                        "Presence set under client ID {client_id}: {}",
+                        desired.state
+                    );
                     self.published = Some(desired);
                 }
                 Err(e) => self.connection_lost(&e.to_string()),
@@ -364,11 +399,19 @@ impl Daemon {
 mod tests {
     use super::*;
     use crate::discord::{OP_FRAME, OP_HANDSHAKE};
-    use crate::testutil::{add_proc, FakeDiscord, TempDir};
+    use crate::testutil::{add_proc, counting_fetcher, FakeDiscord, TempDir, DETECTABLE_SAMPLE};
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     const ELDEN_RING: u64 = 1245620;
     const PORTAL: u64 = 400;
+    const VICTORIA_3: u64 = 529340;
+    const VICTORIA_3_DISCORD_ID: &str = "1124352195157045371";
+
+    /// A valid game list that contains none of the games used in the tests.
+    const UNRELATED_LIST: &str =
+        r#"[{"id": "999", "third_party_skus": [{"distributor": "steam", "id": "1"}]}]"#;
 
     struct Fixture {
         tmp: TempDir,
@@ -384,6 +427,7 @@ mod tests {
                 home: tmp.path().join("home"),
                 socket_dirs: discord::socket_dirs(&tmp.path().join("run")),
                 config_path: tmp.path().join("config.toml"),
+                cache_dir: tmp.path().join("cache"),
             };
             let steamapps = paths.home.join(".local/share/Steam/steamapps");
             fs::create_dir_all(&steamapps).unwrap();
@@ -399,6 +443,11 @@ mod tests {
                 r#""AppState" { "appid" "400" "name" "Portal" }"#,
             )
             .unwrap();
+            fs::write(
+                steamapps.join(format!("appmanifest_{VICTORIA_3}.acf")),
+                r#""AppState" { "appid" "529340" "name" "Victoria 3" }"#,
+            )
+            .unwrap();
             if let Some(config) = config {
                 fs::write(&paths.config_path, config).unwrap();
             }
@@ -409,8 +458,20 @@ mod tests {
             }
         }
 
+        /// A daemon whose game list knows none of the test games, so the
+        /// client ID comes from the config.
         fn daemon(&self) -> Daemon {
-            Daemon::new(self.paths.clone())
+            self.daemon_with_list(Ok(UNRELATED_LIST)).0
+        }
+
+        /// A daemon with the given game list download result, and the
+        /// number of downloads attempted.
+        fn daemon_with_list(
+            &self,
+            list: Result<&'static str, &'static str>,
+        ) -> (Daemon, Arc<AtomicUsize>) {
+            let (fetch, calls) = counting_fetcher(list);
+            (Daemon::new(self.paths.clone(), fetch), calls)
         }
 
         fn socket(&self) -> PathBuf {
@@ -479,22 +540,156 @@ mod tests {
             name: "ELDEN RING".into(),
             proton: true,
             started_ms: 1_700_000_000_000,
+            official: Lookup::NotListed,
         };
-        let activity = build_activity(&game, None);
-        assert_eq!(activity.details, "ELDEN RING");
+        let own = |large_image| Resolved {
+            client_id: "100",
+            large_image,
+            source: Source::Default,
+        };
+        let activity = build_activity(&game, &own(None));
+        assert_eq!(activity.details.as_deref(), Some("ELDEN RING"));
         assert_eq!(activity.state, "Playing via Proton");
         assert_eq!(activity.timestamps.start, 1_700_000_000_000);
         assert_eq!(activity.assets, None);
 
-        let assets = build_activity(&game, Some("elden_ring")).assets.unwrap();
+        let assets = build_activity(&game, &own(Some("elden_ring")))
+            .assets
+            .unwrap();
         assert_eq!(assets.large_image, "elden_ring");
         assert_eq!(assets.large_text, "ELDEN RING");
 
+        // Discord shows the title itself for the game's own application.
+        let official = Resolved {
+            client_id: "555",
+            large_image: None,
+            source: Source::Official,
+        };
+        let activity = build_activity(&game, &official);
+        assert_eq!(activity.details, None);
+        assert_eq!(activity.state, "Playing via Proton");
+
         game.proton = false;
-        assert_eq!(build_activity(&game, None).state, "Playing on Steam");
+        assert_eq!(build_activity(&game, &own(None)).state, "Playing on Steam");
 
         game.name = "é".repeat(200);
-        assert_eq!(build_activity(&game, None).details.chars().count(), 128);
+        let details = build_activity(&game, &own(None)).details.unwrap();
+        assert_eq!(details.chars().count(), 128);
+    }
+
+    #[test]
+    fn shows_a_game_under_discords_own_application_without_any_config() {
+        let fx = Fixture::new(None);
+        let discord = FakeDiscord::start(&fx.socket());
+        fx.start_proton_game(1000, VICTORIA_3);
+        let (mut daemon, downloads) = fx.daemon_with_list(Ok(DETECTABLE_SAMPLE));
+
+        daemon.tick(fx.at(0), 1_000);
+        assert_eq!(daemon.game().unwrap().name, "Victoria 3");
+        let activity = expect_presence(&discord, VICTORIA_3_DISCORD_ID);
+        assert_eq!(
+            activity,
+            json!({
+                "state": "Playing via Proton",
+                "timestamps": { "start": 1_000 },
+            })
+        );
+
+        // The list is downloaded once and then served from the cache,
+        // also for the next game and the next daemon.
+        fx.stop_game(1000);
+        daemon.tick(fx.at(5), 6_000);
+        fx.start_proton_game(1000, ELDEN_RING);
+        daemon.tick(fx.at(10), 11_000);
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+
+        let (mut second, downloads) = fx.daemon_with_list(Err("offline"));
+        second.tick(fx.at(15), 16_000);
+        assert_eq!(
+            second.game().unwrap().official_id(),
+            Some("1402418436809953330")
+        );
+        assert_eq!(downloads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn config_mapping_overrides_discords_application() {
+        let fx = Fixture::new(Some("[games.529340]\nclient_id = \"200\"\n"));
+        let discord = FakeDiscord::start(&fx.socket());
+        fx.start_proton_game(1000, VICTORIA_3);
+        let (mut daemon, downloads) = fx.daemon_with_list(Ok(DETECTABLE_SAMPLE));
+
+        daemon.tick(fx.at(0), 1_000);
+        let activity = expect_presence(&discord, "200");
+        assert_eq!(activity["details"], "Victoria 3");
+        assert_eq!(downloads.load(Ordering::SeqCst), 0, "no lookup is needed");
+    }
+
+    #[test]
+    fn game_list_can_be_disabled() {
+        let fx = Fixture::new(Some(
+            "discord_game_list = false\ndefault_client_id = \"100\"\n",
+        ));
+        let discord = FakeDiscord::start(&fx.socket());
+        fx.start_proton_game(1000, VICTORIA_3);
+        let (mut daemon, downloads) = fx.daemon_with_list(Ok(DETECTABLE_SAMPLE));
+
+        daemon.tick(fx.at(0), 1_000);
+        let activity = expect_presence(&discord, "100");
+        assert_eq!(activity["details"], "Victoria 3");
+        assert_eq!(downloads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unlisted_game_without_a_default_is_not_shown() {
+        let fx = Fixture::new(None);
+        let discord = FakeDiscord::start(&fx.socket());
+        fx.start_proton_game(1000, ELDEN_RING);
+        let (mut daemon, downloads) = fx.daemon_with_list(Ok(UNRELATED_LIST));
+
+        for secs in (0..60).step_by(5) {
+            daemon.tick(fx.at(secs), 0);
+        }
+        assert_eq!(daemon.game().unwrap().official, Lookup::NotListed);
+        assert_eq!(daemon.connect_attempts(), 0);
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+        assert_eq!(discord.try_recv(Duration::from_millis(50)), None);
+    }
+
+    #[test]
+    fn shows_the_game_once_the_game_list_can_be_downloaded() {
+        use std::sync::atomic::AtomicBool;
+
+        let fx = Fixture::new(None);
+        let discord = FakeDiscord::start(&fx.socket());
+        fx.start_proton_game(1000, VICTORIA_3);
+
+        let online = Arc::new(AtomicBool::new(false));
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let (flag, counter) = (Arc::clone(&online), Arc::clone(&downloads));
+        let fetch: Fetcher = Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if flag.load(Ordering::SeqCst) {
+                Ok(DETECTABLE_SAMPLE.as_bytes().to_vec())
+            } else {
+                Err(anyhow::anyhow!("offline"))
+            }
+        });
+        let mut daemon = Daemon::new(fx.paths.clone(), fetch);
+
+        // Offline at game start: nothing to show, and no retry storm.
+        for secs in (0..600).step_by(5) {
+            daemon.tick(fx.at(secs), 1_000);
+        }
+        assert_eq!(daemon.connect_attempts(), 0);
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+
+        // Back online: the retry after ten minutes succeeds.
+        online.store(true, Ordering::SeqCst);
+        daemon.tick(fx.at(600), 601_000);
+        assert_eq!(downloads.load(Ordering::SeqCst), 2);
+        let activity = expect_presence(&discord, VICTORIA_3_DISCORD_ID);
+        assert_eq!(activity["timestamps"]["start"], 1_000);
     }
 
     #[test]

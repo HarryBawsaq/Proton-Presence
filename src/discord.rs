@@ -129,7 +129,8 @@ pub fn probe(dirs: &[PathBuf]) -> Option<PathBuf> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Activity {
-    pub details: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
     pub state: String,
     pub timestamps: Timestamps,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -391,7 +392,7 @@ mod tests {
     #[test]
     fn set_activity_payload_has_the_documented_shape() {
         let activity = Activity {
-            details: "ELDEN RING".into(),
+            details: Some("ELDEN RING".into()),
             state: "Playing via Proton".into(),
             timestamps: Timestamps {
                 start: 1_700_000_000_000,
@@ -481,7 +482,7 @@ mod tests {
         );
 
         let activity = Activity {
-            details: "Game".into(),
+            details: Some("Game".into()),
             state: "Playing via Proton".into(),
             timestamps: Timestamps { start: 5 },
             assets: None,

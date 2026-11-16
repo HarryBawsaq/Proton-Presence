@@ -5,7 +5,7 @@ use std::io::Write;
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::catalog::Fetcher;
 use crate::discord::{encode_frame, read_frame, OP_CLOSE, OP_FRAME, OP_HANDSHAKE};
 
 /// A unique directory under the system temp dir, removed on drop.
@@ -175,4 +176,34 @@ fn serve(mut stream: UnixStream, tx: Sender<(u32, Value)>, reject: bool) {
         }
     }
     let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// A cut-down copy of what Discord serves at `/applications/detectable`.
+pub const DETECTABLE_SAMPLE: &str = r#"[
+  {"aliases": [], "executables": [{"is_launcher": false, "name": "binaries/victoria3.exe", "os": "win32"}],
+   "hook": true, "id": "1124352195157045371", "name": "Victoria 3", "overlay": false,
+   "third_party_skus": [{"distributor": "steam", "id": "529340"}]},
+  {"aliases": ["ELDEN RING"], "executables": [], "id": "1402418436809953330", "name": "ELDEN RING",
+   "third_party_skus": [{"distributor": "xbox", "id": "9P3J32CTXLRZ"}, {"distributor": "steam", "id": "1245620"}]},
+  {"id": "111", "name": "Stray whitespace", "third_party_skus": [{"distributor": "steam", "id": "207490\t"}]},
+  {"id": "222", "name": "First", "third_party_skus": [{"distributor": "steam", "id": "777"}]},
+  {"id": "333", "name": "Second", "third_party_skus": [{"distributor": "steam", "id": "777"}]},
+  {"id": "444", "name": "Xbox only", "third_party_skus": [{"distributor": "xbox", "id": "5"}]},
+  {"id": "555", "name": "Null SKU", "third_party_skus": [{"distributor": "steam", "id": null}]},
+  {"id": "not-a-number", "name": "Bad ID", "third_party_skus": [{"distributor": "steam", "id": "888"}]},
+  {"id": "666", "name": "No SKUs"}
+]"#;
+
+/// A fetcher that always gives the same answer and counts its calls.
+pub fn counting_fetcher(result: Result<&'static str, &'static str>) -> (Fetcher, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let fetch = Box::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        match result {
+            Ok(json) => Ok(json.as_bytes().to_vec()),
+            Err(why) => Err(anyhow::anyhow!(why)),
+        }
+    });
+    (fetch, calls)
 }

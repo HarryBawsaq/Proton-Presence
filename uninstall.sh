@@ -6,6 +6,7 @@ unit=proton-presence.service
 unit_file="$HOME/.config/systemd/user/$unit"
 binary="$HOME/.local/bin/proton-presence"
 config_dir="$HOME/.config/proton-presence"
+cache_dir="$HOME/.cache/proton-presence"
 
 if systemctl --user show-environment >/dev/null 2>&1; then
     echo "==> Stopping and disabling $unit"
@@ -16,6 +17,9 @@ echo "==> Removing $unit_file"
 rm -f "$unit_file"
 echo "==> Removing $binary"
 rm -f "$binary"
+echo "==> Removing the cached game list"
+rm -f "$cache_dir/discord-games.json" "$cache_dir/discord-games.json.tmp"
+rmdir "$cache_dir" 2>/dev/null || true
 
 if systemctl --user show-environment >/dev/null 2>&1; then
     systemctl --user daemon-reload

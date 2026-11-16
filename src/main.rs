@@ -1,6 +1,7 @@
 //! proton-presence: Discord Rich Presence for Steam games running through
 //! Proton. Runs as a systemd user service and polls `/proc` every 5 seconds.
 
+mod catalog;
 mod config;
 mod daemon;
 mod detect;
@@ -18,7 +19,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::config::Config;
+use crate::catalog::Lookup;
+use crate::config::{Config, Resolved, Source};
 use crate::daemon::{Daemon, Game, Paths, POLL_INTERVAL};
 
 const SERVICE: &str = "proton-presence.service";
@@ -36,6 +38,10 @@ Usage:
 
 Environment:
   RUST_LOG   Log level: error, warn, info (default), debug, trace
+
+Games are matched to Discord's own applications using Discord's public game
+list, downloaded with curl about once a week. A config file is optional:
+~/.config/proton-presence/config.toml
 ";
 
 fn main() -> ExitCode {
@@ -75,7 +81,7 @@ fn run() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         POLL_INTERVAL.as_secs()
     );
-    let mut daemon = Daemon::new(paths);
+    let mut daemon = Daemon::new(paths, Box::new(catalog::curl_fetch));
     loop {
         daemon.tick(Instant::now(), daemon::unix_ms());
         thread::sleep(POLL_INTERVAL);
@@ -91,10 +97,26 @@ fn describe_game(game: &Game) -> String {
 }
 
 fn describe_client(config: &Config, game: &Game) -> String {
-    match config.resolve(game.app_id) {
-        Some(r) if r.mapped => format!("{} (from [games.{}])", r.client_id, game.app_id),
-        Some(r) => format!("{} (default)", r.client_id),
-        None => "none configured, so no presence is shown".to_string(),
+    match config.resolve(game.app_id, game.official_id()) {
+        Some(r) => match r.source {
+            Source::Mapped => format!(
+                "{} (from [games.{}] in the config)",
+                r.client_id, game.app_id
+            ),
+            Source::Official => {
+                format!("{} (Discord's own application for this game)", r.client_id)
+            }
+            Source::Default => format!("{} (default_client_id from the config)", r.client_id),
+        },
+        None if !config.discord_game_list => {
+            "none: discord_game_list is off and the config has no client ID for this game".into()
+        }
+        None if game.official == Lookup::Unavailable => {
+            "not known yet: the service downloads Discord's game list when a game starts".into()
+        }
+        None => {
+            "none: this game is not in Discord's game list and default_client_id is not set".into()
+        }
     }
 }
 
@@ -144,9 +166,19 @@ fn status() -> Result<()> {
         println!("Client:   {}", describe_client(config, game));
     }
 
+    if catalog::cache_path(&paths.cache_dir).exists() {
+        println!("Games:    Discord's game list is downloaded");
+    } else {
+        println!(
+            "Games:    Discord's game list is not downloaded yet (happens when a game starts)"
+        );
+    }
+
     let config_path = paths.config_path.display();
     match config {
-        Ok(_) if !paths.config_path.exists() => println!("Config:   {config_path} (not found)"),
+        Ok(_) if !paths.config_path.exists() => {
+            println!("Config:   none (optional; it would be {config_path})")
+        }
         Ok(config) => println!(
             "Config:   {config_path} ({} game mapping(s), default client ID {})",
             config.games.len(),
@@ -167,8 +199,16 @@ fn once() -> Result<()> {
     let game = daemon::detect_game(&paths, daemon::unix_ms());
 
     let activity = game.as_ref().map(|game| {
-        let large_image = config.resolve(game.app_id).and_then(|r| r.large_image);
-        daemon::build_activity(game, large_image)
+        // With no application to show the game under, print the payload an
+        // application of your own would get.
+        let resolved = config
+            .resolve(game.app_id, game.official_id())
+            .unwrap_or(Resolved {
+                client_id: "",
+                large_image: None,
+                source: Source::Default,
+            });
+        daemon::build_activity(game, &resolved)
     });
     match &game {
         Some(game) => {

@@ -1,11 +1,15 @@
 //! `~/.config/proton-presence/config.toml`.
 //!
+//! The file is optional. Without it every game Discord knows is shown
+//! under Discord's own application for that game.
+//!
 //! ```toml
-//! default_client_id = "123456789012345678"
+//! discord_game_list = true           # look games up in Discord's list
+//! default_client_id = "123456789012345678"   # for games Discord lacks
 //!
 //! [games.1245620]                    # Steam app ID
-//! client_id = "234567890123456789"   # optional, falls back to the default
-//! large_image = "elden_ring"         # optional art asset key
+//! client_id = "234567890123456789"   # use this application instead
+//! large_image = "elden_ring"         # art asset key in that application
 //! ```
 
 use std::collections::HashMap;
@@ -16,10 +20,22 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Whether to look games up in Discord's public game list.
+    pub discord_game_list: bool,
     pub default_client_id: Option<String>,
     pub games: HashMap<u64, GameConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            discord_game_list: true,
+            default_client_id: None,
+            games: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,13 +44,23 @@ pub struct GameConfig {
     pub large_image: Option<String>,
 }
 
-/// What to use for one game after applying the default fallback.
+/// Where a game's client ID came from, in order of precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// `client_id` under `[games.<id>]` in the config.
+    Mapped,
+    /// Discord's own application for the game, from its game list.
+    Official,
+    /// `default_client_id` in the config.
+    Default,
+}
+
+/// The Discord application to use for one game.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved<'a> {
     pub client_id: &'a str,
     pub large_image: Option<&'a str>,
-    /// False when the client ID is the default one.
-    pub mapped: bool,
+    pub source: Source,
 }
 
 /// Discord IDs are 64-bit integers; accept them quoted or bare.
@@ -48,6 +74,7 @@ enum RawId {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    discord_game_list: Option<bool>,
     default_client_id: Option<RawId>,
     #[serde(default)]
     games: HashMap<String, RawGame>,
@@ -95,6 +122,7 @@ impl Config {
             );
         }
         Ok(Config {
+            discord_game_list: raw.discord_game_list.unwrap_or(true),
             default_client_id: client_id(raw.default_client_id, "default_client_id")?,
             games,
         })
@@ -109,15 +137,34 @@ impl Config {
         }
     }
 
-    /// The client ID and image for a game, or `None` when the game has no
-    /// mapping and there is no default client ID.
-    pub fn resolve(&self, app_id: u64) -> Option<Resolved<'_>> {
+    /// The Discord application for a game. `official` is the game's own
+    /// application from Discord's game list, if it has one. Returns `None`
+    /// when nothing applies and there is no default client ID.
+    pub fn resolve<'a>(&'a self, app_id: u64, official: Option<&'a str>) -> Option<Resolved<'a>> {
         let game = self.games.get(&app_id);
-        let mapped = game.and_then(|g| g.client_id.as_deref());
+        let large_image = game.and_then(|g| g.large_image.as_deref());
+        let official = official.filter(|_| self.discord_game_list);
+
+        if let Some(client_id) = game.and_then(|g| g.client_id.as_deref()) {
+            return Some(Resolved {
+                client_id,
+                large_image,
+                source: Source::Mapped,
+            });
+        }
+        if let Some(client_id) = official {
+            // Art asset keys belong to your own applications; Discord
+            // shows the game's icon for its own application by itself.
+            return Some(Resolved {
+                client_id,
+                large_image: None,
+                source: Source::Official,
+            });
+        }
         Some(Resolved {
-            client_id: mapped.or(self.default_client_id.as_deref())?,
-            large_image: game.and_then(|g| g.large_image.as_deref()),
-            mapped: mapped.is_some(),
+            client_id: self.default_client_id.as_deref()?,
+            large_image,
+            source: Source::Default,
         })
     }
 }
@@ -160,29 +207,71 @@ client_id = 300
     fn resolves_with_fallback_to_default() {
         let config = Config::parse(EXAMPLE).unwrap();
 
-        let mapped = config.resolve(1245620).unwrap();
+        let mapped = config.resolve(1245620, None).unwrap();
         assert_eq!(mapped.client_id, "200");
         assert_eq!(mapped.large_image, Some("elden_ring"));
-        assert!(mapped.mapped);
+        assert_eq!(mapped.source, Source::Mapped);
 
-        let image_only = config.resolve(620).unwrap();
+        let image_only = config.resolve(620, None).unwrap();
         assert_eq!(image_only.client_id, "100");
         assert_eq!(image_only.large_image, Some("portal2"));
-        assert!(!image_only.mapped);
+        assert_eq!(image_only.source, Source::Default);
 
-        let unmapped = config.resolve(999).unwrap();
+        let unmapped = config.resolve(999, None).unwrap();
         assert_eq!(unmapped.client_id, "100");
         assert_eq!(unmapped.large_image, None);
-        assert!(!unmapped.mapped);
+        assert_eq!(unmapped.source, Source::Default);
+    }
+
+    #[test]
+    fn official_application_beats_default_but_not_a_mapping() {
+        let config = Config::parse(EXAMPLE).unwrap();
+
+        let official = config.resolve(999, Some("555")).unwrap();
+        assert_eq!(official.client_id, "555");
+        assert_eq!(official.source, Source::Official);
+
+        // The image key belongs to the default application, not Discord's.
+        let official = config.resolve(620, Some("555")).unwrap();
+        assert_eq!(official.client_id, "555");
+        assert_eq!(official.large_image, None);
+
+        let mapped = config.resolve(1245620, Some("555")).unwrap();
+        assert_eq!(mapped.client_id, "200");
+        assert_eq!(mapped.source, Source::Mapped);
+    }
+
+    #[test]
+    fn works_without_any_config() {
+        let config = Config::default();
+        assert!(config.discord_game_list);
+        assert_eq!(config.resolve(5, None), None);
+        let official = config.resolve(5, Some("555")).unwrap();
+        assert_eq!(
+            (official.client_id, official.source),
+            ("555", Source::Official)
+        );
+    }
+
+    #[test]
+    fn game_list_can_be_switched_off() {
+        let config = Config::parse("discord_game_list = false\n").unwrap();
+        assert!(!config.discord_game_list);
+        assert_eq!(config.resolve(5, Some("555")), None);
+
+        let config =
+            Config::parse("discord_game_list = false\ndefault_client_id = \"100\"\n").unwrap();
+        assert_eq!(config.resolve(5, Some("555")).unwrap().client_id, "100");
+        assert!(Config::parse("discord_game_list = \"yes\"").is_err());
     }
 
     #[test]
     fn nothing_resolves_without_a_default() {
         let config = Config::parse("[games.5]\nclient_id = \"7\"\n").unwrap();
-        assert_eq!(config.resolve(5).unwrap().client_id, "7");
-        assert_eq!(config.resolve(6), None);
+        assert_eq!(config.resolve(5, None).unwrap().client_id, "7");
+        assert_eq!(config.resolve(6, None), None);
         assert_eq!(Config::parse("").unwrap(), Config::default());
-        assert_eq!(Config::default().resolve(5), None);
+        assert_eq!(Config::default().resolve(5, None), None);
     }
 
     #[test]
