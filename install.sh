@@ -15,12 +15,24 @@ if [ "$(id -u)" -eq 0 ]; then
     echo "Run this as your normal user, not with sudo: it installs a user service." >&2
     exit 1
 fi
+# How to install a missing package on this distribution.
+install_hint() {
+    if command -v pacman >/dev/null; then
+        echo "sudo pacman -S --needed $1"
+    elif command -v apt >/dev/null; then
+        echo "sudo apt install $2"
+    elif command -v dnf >/dev/null; then
+        echo "sudo dnf install $3"
+    else
+        echo "install it with your distribution's package manager"
+    fi
+}
 if ! command -v cargo >/dev/null; then
-    echo "cargo not found. Install Rust first: sudo pacman -S --needed rust" >&2
+    echo "cargo (Rust) not found. Install it first: $(install_hint rust cargo cargo)" >&2
     exit 1
 fi
 if ! command -v curl >/dev/null; then
-    echo "curl not found. Install it first: sudo pacman -S --needed curl" >&2
+    echo "curl not found. Install it first: $(install_hint curl curl curl)" >&2
     exit 1
 fi
 if ! systemctl --user show-environment >/dev/null 2>&1; then
@@ -37,7 +49,7 @@ install -Dm755 target/release/proton-presence "$bin_dir/proton-presence"
 
 # The helper that runs inside a game's Wine prefix is a Windows program.
 # A prebuilt copy is in the repository; it is rebuilt from bridge/bridge.c
-# when a Windows cross-compiler is installed (pacman -S mingw-w64-gcc).
+# when a Windows cross-compiler (mingw-w64) is installed.
 if command -v x86_64-w64-mingw32-gcc >/dev/null; then
     echo "==> Building the bridge helper from source"
     bridge/build.sh

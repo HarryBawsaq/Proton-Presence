@@ -14,6 +14,10 @@ pub struct RunningGame {
     pub proton: bool,
     /// The app's `wineserver` process, if it has one.
     pub wineserver: Option<u32>,
+    /// Whether a Windows program of the app is running in Wine, other
+    /// than Wine's own services. Launch wrappers do not count: they stay
+    /// around for as long as the Wine prefix does.
+    pub wine_running: bool,
 }
 
 /// Process names that belong to Steam, the Steam Runtime container, or Wine
@@ -150,6 +154,7 @@ pub fn scan(proc_root: &Path) -> Vec<RunningGame> {
         game_pid: Option<u32>,
         wine: bool,
         wineserver: Option<u32>,
+        wine_running: bool,
     }
     let mut apps: BTreeMap<u64, App> = BTreeMap::new();
 
@@ -177,6 +182,7 @@ pub fn scan(proc_root: &Path) -> Vec<RunningGame> {
             game_pid: None,
             wine: false,
             wineserver: None,
+            wine_running: false,
         });
         app.wine |= env.wine;
 
@@ -187,6 +193,7 @@ pub fn scan(proc_root: &Path) -> Vec<RunningGame> {
             app.wineserver = lowest(app.wineserver);
         } else if !is_infrastructure(&comm, &cmdline) {
             app.game_pid = lowest(app.game_pid);
+            app.wine_running |= env.wine;
         }
     }
 
@@ -197,9 +204,33 @@ pub fn scan(proc_root: &Path) -> Vec<RunningGame> {
                 pid: app.game_pid?,
                 proton: app.wine,
                 wineserver: app.wineserver,
+                wine_running: app.wine_running,
             })
         })
         .collect()
+}
+
+/// PIDs of bridge helper processes whose environment variable starts
+/// with `env_prefix`, which identifies the daemon instance that started
+/// them. Pass `None` to find the helpers of any instance.
+pub fn helper_pids(proc_root: &Path, env_prefix: Option<&str>) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    let mut pids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let environ = fs::read(entry.path().join("environ")).ok()?;
+            environ
+                .split(|&b| b == 0)
+                .filter_map(|var| var.strip_prefix(HELPER_MARKER)?.strip_prefix(b"="))
+                .any(|value| env_prefix.map_or(true, |want| value.starts_with(want.as_bytes())))
+                .then_some(pid)
+        })
+        .collect();
+    pids.sort_unstable();
+    pids
 }
 
 /// Chooses which game to show. The game already being shown stays as long
@@ -391,6 +422,7 @@ mod tests {
                 pid: 1010,
                 proton: true,
                 wineserver: Some(1002),
+                wine_running: true,
             }]
         );
     }
@@ -425,7 +457,7 @@ mod tests {
         let helper = [
             ("SteamAppId", "620"),
             ("WINEPREFIX", "/x/pfx"),
-            ("PROTON_PRESENCE_BRIDGE", "4242:token"),
+            ("PROTON_PRESENCE_BRIDGE", "4242:token.0"),
         ];
         add_proc(tmp.path(), 10, "wineserver", &["wineserver"], &game);
         // The helper's launcher and Wine processes carry the game's
@@ -448,11 +480,57 @@ mod tests {
                 pid: 30,
                 proton: true,
                 wineserver: Some(10),
+                wine_running: true,
             }]
         );
+        assert_eq!(helper_pids(tmp.path(), Some("4242:token.")), [20, 21]);
+        assert_eq!(helper_pids(tmp.path(), None), [20, 21]);
+        assert!(helper_pids(tmp.path(), Some("4242:other.")).is_empty());
+        assert!(helper_pids(tmp.path(), Some("4243:token.")).is_empty());
 
         let env: Vec<u8> = b"SteamAppId=620\0PROTON_PRESENCE_BRIDGE=1:t\0".to_vec();
         assert!(parse_environ(&env).unwrap().helper);
+    }
+
+    #[test]
+    fn launch_wrappers_do_not_count_as_a_running_windows_program() {
+        let tmp = TempDir::new("proc");
+        let steam = [("SteamAppId", "620")];
+        let wine = [("SteamAppId", "620"), ("WINEPREFIX", "/x/pfx")];
+        // What is left after quitting a game whose Wine prefix has not
+        // shut down yet: Steam's launch chain, a wrapper from the launch
+        // options, the Wine server and Wine's services.
+        add_proc(tmp.path(), 10, "reaper", &["reaper", "SteamLaunch"], &steam);
+        add_proc(
+            tmp.path(),
+            11,
+            "systemd-inhibit",
+            &["systemd-inhibit", "--", "game"],
+            &steam,
+        );
+        add_proc(tmp.path(), 12, "sh", &["sh", "-c", "launch"], &steam);
+        add_proc(tmp.path(), 20, "wineserver", &["wineserver"], &wine);
+        add_proc(
+            tmp.path(),
+            21,
+            "services.exe",
+            &["C:\\windows\\system32\\services.exe"],
+            &wine,
+        );
+
+        let games = scan(tmp.path());
+        assert_eq!(games.len(), 1, "the wrappers still look like a game");
+        assert!(games[0].proton);
+        assert!(!games[0].wine_running, "but no Windows program is running");
+
+        add_proc(
+            tmp.path(),
+            30,
+            "victoria3.exe",
+            &["Z:\\g\\victoria3.exe"],
+            &wine,
+        );
+        assert!(scan(tmp.path())[0].wine_running);
     }
 
     #[test]
@@ -472,6 +550,7 @@ mod tests {
                 pid: 50,
                 proton: false,
                 wineserver: None,
+                wine_running: false,
             }]
         );
     }
@@ -490,6 +569,7 @@ mod tests {
             pid,
             proton: true,
             wineserver: None,
+            wine_running: true,
         };
         let games = [game(10, 500), game(20, 300)];
         assert_eq!(pick_active(&games, None).unwrap().app_id, 20);

@@ -86,7 +86,7 @@ fn run() -> Result<()> {
     let mut daemon = Daemon::new(
         paths,
         Box::new(catalog::curl_fetch),
-        Box::new(bridge::spawn_helper),
+        Box::new(bridge::SystemRunner),
     );
     loop {
         daemon.tick(Instant::now(), daemon::unix_ms());

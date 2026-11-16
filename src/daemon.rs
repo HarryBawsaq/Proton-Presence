@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 
-use crate::bridge::{self, BridgeServer, Launcher};
+use crate::bridge::{self, BridgeServer, HelperRunner};
 use crate::catalog::{Catalog, Fetcher, Lookup};
 use crate::config::{Config, Resolved, Source};
 use crate::detect::{self, RunningGame};
@@ -26,6 +26,11 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const MAX_DETAILS_CHARS: usize = 128;
 /// How long a launched bridge helper gets to connect back.
 const HELPER_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// Polls without a Windows program of the game before its helper is
+/// dismissed, so a gap between a launcher and the game does not count.
+const HELPER_IDLE_POLLS: u8 = 2;
+/// Helper starts per game, counting restarts after it exited by itself.
+const MAX_HELPER_LAUNCHES: u8 = 3;
 
 /// Reconnect delay that doubles from `initial` and then stays at `max`.
 #[derive(Debug, Clone)]
@@ -100,7 +105,14 @@ pub struct Game {
     pub official: Lookup,
     /// The Wine server of the game's prefix, for Proton games.
     pub wineserver: Option<u32>,
+    /// Whether a Windows program of the game is running right now, and
+    /// whether one ever was. See [`RunningGame::wine_running`].
+    pub wine_running: bool,
+    pub wine_seen: bool,
     pub helper: HelperState,
+    /// Consecutive polls without a Windows program of the game.
+    pub idle_polls: u8,
+    pub helper_launches: u8,
 }
 
 /// Progress of the bridge helper for one game.
@@ -110,8 +122,8 @@ pub enum HelperState {
     /// Launched at this instant; it has not connected back yet.
     Launched(Instant),
     Connected,
-    /// It could not be started, or never connected. Not retried.
-    Failed,
+    /// Dismissed, or given up on. Not started again for this game.
+    Stopped,
 }
 
 impl Game {
@@ -125,7 +137,11 @@ impl Game {
             started_ms: now_ms,
             official: Lookup::Unavailable,
             wineserver: running.wineserver,
+            wine_running: running.wine_running,
+            wine_seen: running.wine_running,
             helper: HelperState::NotStarted,
+            idle_polls: 0,
+            helper_launches: 0,
         }
     }
 
@@ -192,9 +208,12 @@ pub struct Daemon {
     catalog: Catalog,
     /// Started when the first helper is needed.
     bridge: Option<BridgeServer>,
-    launcher: Launcher,
+    runner: Box<dyn HelperRunner>,
     /// Helper processes, kept until they have exited.
     helpers: Vec<Child>,
+    /// Helpers that were told to exit on the previous poll. Any that are
+    /// still there on the next one are stopped by force.
+    dismissed: Vec<u32>,
     /// Whether the game is currently reporting a presence of its own.
     game_presence: bool,
     connect_attempts: u64,
@@ -202,13 +221,24 @@ pub struct Daemon {
 
 impl Daemon {
     /// `fetch` downloads Discord's game list (see [`crate::catalog`]) and
-    /// `launcher` starts the bridge helper (see [`crate::bridge`]).
-    pub fn new(paths: Paths, fetch: Fetcher, launcher: Launcher) -> Daemon {
+    /// `runner` starts and stops the bridge helper (see [`crate::bridge`]).
+    pub fn new(paths: Paths, fetch: Fetcher, mut runner: Box<dyn HelperRunner>) -> Daemon {
+        // Helpers of an earlier instance exit when it goes away. One that
+        // did not would keep its game's Wine prefix alive.
+        let stale = detect::helper_pids(&paths.proc_root, None);
+        if !stale.is_empty() {
+            warn!(
+                "Stopping {} bridge helper(s) left over from an earlier run",
+                stale.len()
+            );
+            runner.kill(&stale);
+        }
         let mut daemon = Daemon {
             catalog: Catalog::new(&paths.cache_dir, fetch),
             bridge: None,
-            launcher,
+            runner,
             helpers: Vec::new(),
+            dismissed: Vec::new(),
             game_presence: false,
             paths,
             config: Config::default(),
@@ -236,6 +266,7 @@ impl Daemon {
             info!("Config changed, reloading");
             self.load_config();
         }
+        self.stop_dismissed_helpers();
         self.update_game(now_ms);
         self.manage_helper(now);
         self.helpers
@@ -279,6 +310,8 @@ impl Daemon {
                 game.proton |= active.proton;
                 game.pid = active.pid;
                 game.wineserver = active.wineserver;
+                game.wine_running = active.wine_running;
+                game.wine_seen |= active.wine_running;
                 return;
             }
         }
@@ -294,42 +327,117 @@ impl Daemon {
         }
     }
 
-    /// Tells running helpers to exit.
+    /// Tells running helpers to exit, and remembers them so that any that
+    /// do not are stopped on the next poll.
     fn dismiss_helpers(&mut self) {
-        if let Some(bridge) = &self.bridge {
-            bridge.disconnect_helpers();
+        let Some(bridge) = &self.bridge else { return };
+        bridge.disconnect_helpers();
+        self.dismissed = detect::helper_pids(&self.paths.proc_root, Some(&bridge.env_prefix()));
+    }
+
+    /// Stops helpers that were dismissed a poll ago and are still running.
+    /// A helper that lingers keeps the game's Wine prefix alive, and with
+    /// it Steam's "running" state, so this must not depend on the
+    /// helper's cooperation.
+    fn stop_dismissed_helpers(&mut self) {
+        if self.dismissed.is_empty() {
+            return;
+        }
+        let Some(bridge) = &self.bridge else { return };
+        let alive = detect::helper_pids(&self.paths.proc_root, Some(&bridge.env_prefix()));
+        let stuck: Vec<u32> = std::mem::take(&mut self.dismissed)
+            .into_iter()
+            .filter(|pid| alive.contains(pid))
+            .collect();
+        if !stuck.is_empty() {
+            warn!("The bridge helper did not exit when told to; stopping it");
+            self.runner.kill(&stuck);
         }
     }
 
-    /// Starts the bridge helper next to a Proton game, once per game, so
-    /// that the game's own Rich Presence can reach Discord, and reports
-    /// whether it came up.
+    /// Starts the bridge helper next to a Proton game so that the game's
+    /// own Rich Presence can reach Discord, reports whether it came up,
+    /// and dismisses it once the game's Windows programs are gone.
     fn manage_helper(&mut self, now: Instant) {
-        let Some(game) = &mut self.game else { return };
-        if let HelperState::Launched(at) = game.helper {
-            if self
-                .bridge
-                .as_ref()
-                .is_some_and(BridgeServer::helper_connected)
-            {
+        if self.supervise_helper(now) {
+            self.dismiss_helpers();
+        }
+        self.launch_helper(now);
+    }
+
+    /// Follows a started helper. Returns whether it has to be dismissed.
+    fn supervise_helper(&mut self, now: Instant) -> bool {
+        let Some(game) = &mut self.game else {
+            return false;
+        };
+        let connected = self
+            .bridge
+            .as_ref()
+            .is_some_and(BridgeServer::helper_connected);
+
+        // Steam's launch chain stays until the Wine prefix shuts down, and
+        // the prefix must not be kept waiting for the helper. So the
+        // helper goes as soon as no Windows program of the game is left,
+        // even though the launch chain still looks like a running game.
+        let started = matches!(
+            game.helper,
+            HelperState::Launched(_) | HelperState::Connected
+        );
+        if started && game.wine_seen && !game.wine_running {
+            game.idle_polls += 1;
+            if game.idle_polls >= HELPER_IDLE_POLLS {
+                debug!(
+                    "{} has no Windows program left; dismissing the bridge helper",
+                    game.name
+                );
+                game.helper = HelperState::Stopped;
+                return true;
+            }
+        } else {
+            game.idle_polls = 0;
+        }
+
+        match game.helper {
+            HelperState::Launched(_) if connected => {
                 info!("Ready to pass on in-game details of {}", game.name);
                 game.helper = HelperState::Connected;
-            } else if now.duration_since(at) >= HELPER_START_TIMEOUT {
+            }
+            HelperState::Launched(at) if now.duration_since(at) >= HELPER_START_TIMEOUT => {
                 warn!(
                     "In-game details of {} cannot be passed on: the bridge helper did not start in its Wine prefix",
                     game.name
                 );
-                game.helper = HelperState::Failed;
+                game.helper = HelperState::Stopped;
+                return true;
             }
-            return;
+            HelperState::Connected if !connected => {
+                // It exits by itself when Wine reports the prefix idle.
+                // If the game is in fact still running, start it again.
+                if game.wine_running && game.helper_launches < MAX_HELPER_LAUNCHES {
+                    debug!(
+                        "The bridge helper of {} exited; starting it again",
+                        game.name
+                    );
+                    game.helper = HelperState::NotStarted;
+                } else {
+                    debug!("The bridge helper of {} exited", game.name);
+                    game.helper = HelperState::Stopped;
+                }
+            }
+            _ => {}
         }
+        false
+    }
+
+    fn launch_helper(&mut self, now: Instant) {
+        let Some(game) = &mut self.game else { return };
         let Some(wineserver) = game.wineserver else {
             return;
         };
         if game.helper != HelperState::NotStarted || !self.config.game_rich_presence {
             return;
         }
-        game.helper = HelperState::Failed;
+        game.helper = HelperState::Stopped;
         if !self.paths.bridge_helper.is_file() {
             debug!(
                 "No bridge helper at {}; in-game details are not passed on",
@@ -349,14 +457,17 @@ impl Daemon {
                 &self.paths.proc_root,
                 wineserver,
                 &self.paths.bridge_helper,
-                &bridge.env_value(),
+                &bridge.launch_env(),
             )?;
-            (self.launcher)(&launch).context("cannot start the bridge helper")
+            self.runner
+                .launch(&launch)
+                .context("cannot start the bridge helper")
         })();
         match started {
             Ok(child) => {
                 debug!("Started the bridge helper for {}", game.name);
                 game.helper = HelperState::Launched(now);
+                game.helper_launches += 1;
                 self.helpers.extend(child);
             }
             Err(e) => warn!(
@@ -555,6 +666,25 @@ mod tests {
         start: Instant,
         /// Every bridge helper launch requested by this fixture's daemons.
         launches: Arc<Mutex<Vec<Launch>>>,
+        /// Every set of processes they asked to have stopped by force.
+        kills: Arc<Mutex<Vec<Vec<u32>>>>,
+    }
+
+    /// Records what it is asked to do and does nothing.
+    struct RecordingRunner {
+        launches: Arc<Mutex<Vec<Launch>>>,
+        kills: Arc<Mutex<Vec<Vec<u32>>>>,
+    }
+
+    impl HelperRunner for RecordingRunner {
+        fn launch(&mut self, launch: &Launch) -> std::io::Result<Option<Child>> {
+            self.launches.lock().unwrap().push(launch.clone());
+            Ok(None)
+        }
+
+        fn kill(&mut self, pids: &[u32]) {
+            self.kills.lock().unwrap().push(pids.to_vec());
+        }
     }
 
     impl Fixture {
@@ -597,6 +727,7 @@ mod tests {
                 paths,
                 start: Instant::now(),
                 launches: Arc::default(),
+                kills: Arc::default(),
             }
         }
 
@@ -613,20 +744,29 @@ mod tests {
             list: Result<&'static str, &'static str>,
         ) -> (Daemon, Arc<AtomicUsize>) {
             let (fetch, calls) = counting_fetcher(list);
-            (
-                Daemon::new(self.paths.clone(), fetch, self.launcher()),
-                calls,
-            )
+            (Daemon::new(self.paths.clone(), fetch, self.runner()), calls)
         }
 
-        /// A launcher that records what it is asked to start and starts
-        /// nothing.
-        fn launcher(&self) -> Launcher {
-            let launches = Arc::clone(&self.launches);
-            Box::new(move |launch| {
-                launches.lock().unwrap().push(launch.clone());
-                Ok(None)
+        fn runner(&self) -> Box<dyn HelperRunner> {
+            Box::new(RecordingRunner {
+                launches: Arc::clone(&self.launches),
+                kills: Arc::clone(&self.kills),
             })
+        }
+
+        /// The environment value the last launched helper was given.
+        fn helper_env(&self) -> String {
+            self.launches
+                .lock()
+                .unwrap()
+                .last()
+                .expect("no helper was launched")
+                .env
+                .iter()
+                .find(|(key, _)| key == bridge::ENV_VAR)
+                .and_then(|(_, value)| value.to_str())
+                .unwrap()
+                .to_string()
         }
 
         /// Installs the bridge helper and gives the game started with
@@ -643,16 +783,7 @@ mod tests {
 
         /// Connects to the daemon's bridge the way a started helper does.
         fn helper_connect(&self, kind: char) -> TcpStream {
-            let launches = self.launches.lock().unwrap();
-            let value = launches
-                .last()
-                .expect("no helper was launched")
-                .env
-                .iter()
-                .find(|(key, _)| key == bridge::ENV_VAR)
-                .and_then(|(_, value)| value.to_str())
-                .unwrap()
-                .to_string();
+            let value = self.helper_env();
             let (port, token) = value.split_once(':').unwrap();
             let mut stream =
                 TcpStream::connect((Ipv4Addr::LOCALHOST, port.parse::<u16>().unwrap())).unwrap();
@@ -730,7 +861,11 @@ mod tests {
             started_ms: 1_700_000_000_000,
             official: Lookup::NotListed,
             wineserver: None,
+            wine_running: false,
+            wine_seen: false,
             helper: HelperState::NotStarted,
+            idle_polls: 0,
+            helper_launches: 0,
         };
         let own = |large_image| Resolved {
             client_id: "100",
@@ -857,7 +992,7 @@ mod tests {
                 Err(anyhow::anyhow!("offline"))
             }
         });
-        let mut daemon = Daemon::new(fx.paths.clone(), fetch, fx.launcher());
+        let mut daemon = Daemon::new(fx.paths.clone(), fetch, fx.runner());
 
         // Offline at game start: nothing to show, and no retry storm.
         for secs in (0..600).step_by(5) {
@@ -1287,9 +1422,174 @@ mod tests {
             HelperState::Launched(_)
         ));
         daemon.tick(fx.at(45), 0);
-        assert_eq!(daemon.game().unwrap().helper, HelperState::Failed);
+        assert_eq!(daemon.game().unwrap().helper, HelperState::Stopped);
         daemon.tick(fx.at(50), 0);
         assert_eq!(fx.launches.lock().unwrap().len(), 2);
+    }
+
+    /// Reads until the peer closes the connection; panics if it does not.
+    fn expect_closed(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).unwrap(), 0);
+    }
+
+    #[test]
+    fn dismisses_the_helper_when_only_the_launch_chain_is_left() {
+        let fx = Fixture::new(None);
+        // A wrapper from the game's launch options. It carries the game's
+        // app ID and stays until the Wine prefix shuts down.
+        add_proc(
+            &fx.paths.proc_root,
+            990,
+            "systemd-inhibit",
+            &["systemd-inhibit", "--", "game"],
+            &[("SteamAppId", "529340")],
+        );
+        fx.start_proton_game(1000, VICTORIA_3);
+        fx.install_bridge(1000);
+        let (mut daemon, _) = fx.daemon_with_list(Ok(DETECTABLE_SAMPLE));
+
+        daemon.tick(fx.at(0), 0);
+        let mut control = fx.helper_connect('C');
+        tick_until(&mut daemon, fx.at(5), "the helper is seen", |d| {
+            d.game().unwrap().helper == HelperState::Connected
+        });
+
+        // Quit to desktop: the game's program is gone, the wrapper and
+        // the Wine server are not. The helper must not wait for them,
+        // because they are waiting for the helper.
+        fx.stop_game(1000);
+        daemon.tick(fx.at(10), 0);
+        assert_eq!(
+            daemon.game().unwrap().helper,
+            HelperState::Connected,
+            "one poll of grace"
+        );
+        daemon.tick(fx.at(15), 0);
+        assert_eq!(daemon.game().unwrap().helper, HelperState::Stopped);
+        expect_closed(&mut control);
+
+        // It is not started again while the launch chain winds down.
+        daemon.tick(fx.at(20), 0);
+        daemon.tick(fx.at(25), 0);
+        assert_eq!(fx.launches.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn keeps_the_helper_through_a_short_gap_between_launcher_and_game() {
+        let fx = Fixture::new(None);
+        fx.start_proton_game(1000, VICTORIA_3);
+        fx.install_bridge(1000);
+        let (mut daemon, _) = fx.daemon_with_list(Ok(DETECTABLE_SAMPLE));
+        daemon.tick(fx.at(0), 0);
+        let _control = fx.helper_connect('C');
+        tick_until(&mut daemon, fx.at(5), "the helper is seen", |d| {
+            d.game().unwrap().helper == HelperState::Connected
+        });
+
+        // The launcher has exited and the game has not appeared yet. Only
+        // a wrapper keeps the app visible for one poll.
+        add_proc(
+            &fx.paths.proc_root,
+            990,
+            "sh",
+            &["sh"],
+            &[("SteamAppId", "529340")],
+        );
+        fx.stop_game(1000);
+        daemon.tick(fx.at(10), 0);
+        fx.start_proton_game(1000, VICTORIA_3);
+        daemon.tick(fx.at(15), 0);
+        daemon.tick(fx.at(20), 0);
+        assert_eq!(daemon.game().unwrap().helper, HelperState::Connected);
+    }
+
+    #[test]
+    fn stops_a_dismissed_helper_by_force_if_it_is_still_there() {
+        let fx = Fixture::new(None);
+        fx.start_proton_game(1000, VICTORIA_3);
+        fx.install_bridge(1000);
+        let (mut daemon, _) = fx.daemon_with_list(Ok(DETECTABLE_SAMPLE));
+        daemon.tick(fx.at(0), 0);
+
+        // The helper's processes, as they appear in /proc. One of them is
+        // stuck and one exits when told to.
+        let value = fx.helper_env();
+        let env = [("SteamAppId", "529340"), (bridge::ENV_VAR, value.as_str())];
+        add_proc(
+            &fx.paths.proc_root,
+            2000,
+            "proton-presence",
+            &["bridge.exe"],
+            &env,
+        );
+        add_proc(&fx.paths.proc_root, 2001, "nsenter", &["nsenter"], &env);
+        // A helper of some other instance must be left alone.
+        let other = [("SteamAppId", "1"), (bridge::ENV_VAR, "1:other.0")];
+        add_proc(
+            &fx.paths.proc_root,
+            2002,
+            "proton-presence",
+            &["bridge.exe"],
+            &other,
+        );
+
+        fx.stop_game(1000);
+        daemon.tick(fx.at(5), 0);
+        assert_eq!(daemon.game(), None);
+        assert!(
+            fx.kills.lock().unwrap().is_empty(),
+            "it gets one poll to exit"
+        );
+
+        fs::remove_dir_all(fx.paths.proc_root.join("2001")).unwrap();
+        daemon.tick(fx.at(10), 0);
+        assert_eq!(*fx.kills.lock().unwrap(), [vec![2000]]);
+
+        daemon.tick(fx.at(15), 0);
+        assert_eq!(fx.kills.lock().unwrap().len(), 1, "only once");
+    }
+
+    #[test]
+    fn restarts_a_helper_that_exited_while_the_game_is_running() {
+        let fx = Fixture::new(None);
+        fx.start_proton_game(1000, VICTORIA_3);
+        fx.install_bridge(1000);
+        let (mut daemon, _) = fx.daemon_with_list(Ok(DETECTABLE_SAMPLE));
+        daemon.tick(fx.at(0), 0);
+
+        for launches in 1..=3 {
+            assert_eq!(fx.launches.lock().unwrap().len(), launches);
+            let control = fx.helper_connect('C');
+            tick_until(&mut daemon, fx.at(5), "the helper is seen", |d| {
+                d.game().unwrap().helper == HelperState::Connected
+            });
+            drop(control);
+            tick_until(&mut daemon, fx.at(10), "the exit is noticed", |d| {
+                d.game().unwrap().helper != HelperState::Connected
+            });
+        }
+        // Three starts per game and no more.
+        assert_eq!(daemon.game().unwrap().helper, HelperState::Stopped);
+        daemon.tick(fx.at(15), 0);
+        assert_eq!(fx.launches.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn stops_helpers_left_over_from_an_earlier_run() {
+        let fx = Fixture::new(None);
+        add_proc(
+            &fx.paths.proc_root,
+            3000,
+            "proton-presence",
+            &["bridge.exe"],
+            &[("SteamAppId", "529340"), (bridge::ENV_VAR, "999:old-token")],
+        );
+        let _daemon = fx.daemon();
+        assert_eq!(*fx.kills.lock().unwrap(), [vec![3000]]);
     }
 
     #[test]

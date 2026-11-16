@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::vdf::{self, Value};
 
 /// Steam installation roots relative to the home directory: the native
-/// client and the Flatpak (`com.valvesoftware.Steam`) client.
+/// client (Valve's Debian package puts it behind the `~/.steam/steam`
+/// link), the Flatpak (`com.valvesoftware.Steam`) and the Snap.
 const STEAM_ROOTS: &[&str] = &[
     ".steam/steam",
     ".steam/root",
@@ -14,6 +15,8 @@ const STEAM_ROOTS: &[&str] = &[
     ".var/app/com.valvesoftware.Steam/.steam/steam",
     ".var/app/com.valvesoftware.Steam/.local/share/Steam",
     ".var/app/com.valvesoftware.Steam/data/Steam",
+    "snap/steam/common/.local/share/Steam",
+    "snap/steam/common/.steam/steam",
 ];
 
 /// Extracts library paths from the text of a `libraryfolders.vdf`.

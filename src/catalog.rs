@@ -158,7 +158,7 @@ impl Catalog {
     pub fn lookup(&mut self, steam_app_id: u64, now: Instant, now_ms: u64) -> Lookup {
         let mut index = read_cache(&self.cache);
         let outdated = index.is_none() || self.is_stale(now_ms);
-        if outdated && self.retry_at.is_none_or(|due| now >= due) && self.refresh(now) {
+        if outdated && self.retry_at.map_or(true, |due| now >= due) && self.refresh(now) {
             index = read_cache(&self.cache);
         }
         // A stale cache is still better than nothing.

@@ -23,19 +23,19 @@ use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use log::debug;
+use log::{debug, info, warn};
 use serde_json::Value;
 
-use crate::discord::{self, decode_frame, OP_FRAME};
+use crate::discord::{self, decode_frame, OP_CLOSE, OP_FRAME, OP_HANDSHAKE};
 
-/// Tells the helper where the daemon is (`<port>:<token>`), and marks the
-/// helper's processes so the game scan ignores them.
+/// Tells the helper where the daemon is (`<port>:<token>.<launch>`), and
+/// marks the helper's processes so the game scan ignores them.
 pub const ENV_VAR: &str = "PROTON_PRESENCE_BRIDGE";
 pub const HELPER_NAME: &str = "proton-presence-bridge.exe";
 
@@ -63,6 +63,11 @@ struct Shared {
     active: AtomicUsize,
     /// Control connections of running helpers.
     controls: Mutex<Vec<TcpStream>>,
+    /// Number of the next helper launch.
+    next_launch: AtomicU64,
+    /// Launches below this number have been dismissed. A helper from one
+    /// of them is turned away even if it only connects afterwards.
+    first_valid: AtomicU64,
 }
 
 /// The daemon's end of the bridge: a TCP listener on 127.0.0.1.
@@ -81,6 +86,8 @@ impl BridgeServer {
             socket_dirs,
             active: AtomicUsize::new(0),
             controls: Mutex::new(Vec::new()),
+            next_launch: AtomicU64::new(0),
+            first_valid: AtomicU64::new(0),
         });
 
         let accept_shared = Arc::clone(&shared);
@@ -99,9 +106,17 @@ impl BridgeServer {
         Ok(BridgeServer { port, shared })
     }
 
-    /// The value of [`ENV_VAR`] for a helper: `<port>:<token>`.
-    pub fn env_value(&self) -> String {
-        format!("{}:{}", self.port, self.shared.token)
+    /// The value of [`ENV_VAR`] for a new helper launch:
+    /// `<port>:<token>.<launch>`.
+    pub fn launch_env(&self) -> String {
+        let launch = self.shared.next_launch.fetch_add(1, Ordering::SeqCst);
+        format!("{}{launch}", self.env_prefix())
+    }
+
+    /// What the [`ENV_VAR`] value of every helper of this daemon starts
+    /// with.
+    pub fn env_prefix(&self) -> String {
+        format!("{}:{}.", self.port, self.shared.token)
     }
 
     /// Whether the game is publishing an activity of its own right now.
@@ -114,9 +129,14 @@ impl BridgeServer {
         !self.shared.controls.lock().unwrap().is_empty()
     }
 
-    /// Tells every helper to exit by closing its control connection.
+    /// Tells every helper launched so far to exit, by closing its control
+    /// connection now or as soon as it connects.
     pub fn disconnect_helpers(&self) {
-        for control in self.shared.controls.lock().unwrap().drain(..) {
+        // Under the lock, so no helper can register in between.
+        let mut controls = self.shared.controls.lock().unwrap();
+        let launched = self.shared.next_launch.load(Ordering::SeqCst);
+        self.shared.first_valid.store(launched, Ordering::SeqCst);
+        for control in controls.drain(..) {
             let _ = control.shutdown(Shutdown::Both);
         }
     }
@@ -128,15 +148,21 @@ fn random_token() -> String {
     format!("{:016x}{:016x}", word(), word())
 }
 
-/// Reads the helper's first line, `<kind> <token>\n`, and returns the kind.
-fn read_hello(stream: &mut TcpStream, token: &str) -> Option<u8> {
+/// Reads the helper's first line, `<kind> <token>.<launch>\n`, and returns
+/// the kind and the launch number.
+fn read_hello(stream: &mut TcpStream, token: &str) -> Option<(u8, u64)> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     while line.len() < MAX_HELLO {
         match stream.read(&mut byte) {
             Ok(1) if byte[0] == b'\n' => {
                 let (kind, rest) = line.split_first()?;
-                return (rest.strip_prefix(b" ")? == token.as_bytes()).then_some(*kind);
+                let launch = rest
+                    .strip_prefix(b" ")?
+                    .strip_prefix(token.as_bytes())?
+                    .strip_prefix(b".")?;
+                let launch = std::str::from_utf8(launch).ok()?.parse().ok()?;
+                return Some((*kind, launch));
             }
             Ok(1) => line.push(byte[0]),
             _ => return None,
@@ -147,24 +173,34 @@ fn read_hello(stream: &mut TcpStream, token: &str) -> Option<u8> {
 
 fn handle(mut stream: TcpStream, shared: &Shared) {
     let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
-    let Some(kind) = read_hello(&mut stream, &shared.token) else {
+    let Some((kind, launch)) = read_hello(&mut stream, &shared.token) else {
         debug!("Bridge: rejected a connection without a valid token");
         return;
     };
     let _ = stream.set_read_timeout(None);
     match kind {
-        b'C' => control(stream, shared),
-        b'D' => relay(stream, shared),
+        b'C' => control(stream, shared, launch),
+        b'D' if launch >= shared.first_valid.load(Ordering::SeqCst) => relay(stream, shared),
         _ => {}
     }
 }
 
 /// Holds a helper's control connection until either side closes it.
-fn control(mut stream: TcpStream, shared: &Shared) {
+fn control(mut stream: TcpStream, shared: &Shared, launch: u64) {
     let Ok(peer) = stream.peer_addr() else { return };
-    match stream.try_clone() {
-        Ok(clone) => shared.controls.lock().unwrap().push(clone),
-        Err(_) => return,
+    {
+        // Checked under the lock that `disconnect_helpers` takes, so a
+        // helper is either registered before a dismissal and closed by
+        // it, or sees the dismissal here.
+        let mut controls = shared.controls.lock().unwrap();
+        if launch < shared.first_valid.load(Ordering::SeqCst) {
+            debug!("Bridge: turned away a helper that was already dismissed");
+            return;
+        }
+        match stream.try_clone() {
+            Ok(clone) => controls.push(clone),
+            Err(_) => return,
+        }
     }
     debug!("Bridge: helper connected");
     let mut byte = [0u8; 1];
@@ -182,13 +218,27 @@ fn relay(mut game: TcpStream, shared: &Shared) {
     // If Discord is closed the connection is simply dropped; the game's
     // Discord library retries on its own.
     let Some((mut discord, _)) = discord::connect_any(&shared.socket_dirs) else {
+        debug!("Bridge: the game looked for Discord, but Discord is not running");
         return;
     };
     let (Ok(mut to_game), Ok(mut from_discord)) = (game.try_clone(), discord.try_clone()) else {
         return;
     };
     let replies = thread::spawn(move || {
-        let _ = io::copy(&mut from_discord, &mut to_game);
+        let mut frames = FrameSplitter::default();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match from_discord.read(&mut chunk) {
+                Ok(n) if n > 0 => n,
+                _ => break,
+            };
+            if to_game.write_all(&chunk[..n]).is_err() {
+                break;
+            }
+            for (opcode, body) in frames.feed(&chunk[..n]) {
+                log_reply(opcode, &body);
+            }
+        }
         let _ = to_game.shutdown(Shutdown::Both);
     });
 
@@ -208,6 +258,7 @@ fn relay(mut game: TcpStream, shared: &Shared) {
             None => 0,
         };
     }
+    debug!("Bridge: the game's connection to Discord closed");
     if tracker.active {
         shared.active.fetch_sub(1, Ordering::SeqCst);
     }
@@ -216,36 +267,47 @@ fn relay(mut game: TcpStream, shared: &Shared) {
     let _ = replies.join();
 }
 
-/// Follows the frames a game sends to see whether it holds an activity.
+/// Logs what Discord answers the game, so a presence that does not show
+/// up can be traced.
+fn log_reply(opcode: u32, body: &Value) {
+    let message = body["data"]["message"]
+        .as_str()
+        .or(body["message"].as_str())
+        .unwrap_or("no reason given");
+    match opcode {
+        OP_CLOSE => warn!("Discord refused the game's connection: {message}"),
+        OP_FRAME if body["evt"] == "ERROR" => warn!(
+            "Discord rejected the game's {} request: {message}",
+            body["cmd"].as_str().unwrap_or("unknown")
+        ),
+        OP_FRAME if body["evt"] == "READY" => debug!("Bridge: Discord accepted the game"),
+        _ => {}
+    }
+}
+
+/// Cuts a relayed byte stream into Discord IPC frames for inspection.
 #[derive(Default)]
-pub struct ActivityTracker {
+struct FrameSplitter {
     buf: Vec<u8>,
-    active: bool,
     /// Set when the stream stops looking like Discord IPC. The bytes are
     /// still relayed; they are just no longer inspected.
     lost: bool,
 }
 
-impl ActivityTracker {
-    /// Takes the next bytes from the game. Returns `Some(active)` when the
-    /// game set (`true`) or cleared (`false`) its activity.
-    pub fn feed(&mut self, bytes: &[u8]) -> Option<bool> {
+impl FrameSplitter {
+    /// Takes the next bytes and returns the frames they complete.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<(u32, Value)> {
+        let mut frames = Vec::new();
         if self.lost {
-            return None;
+            return frames;
         }
         self.buf.extend_from_slice(bytes);
-        let before = self.active;
         loop {
             match decode_frame(&self.buf) {
                 Ok(Some((opcode, payload, used))) => {
                     self.buf.drain(..used);
-                    if opcode != OP_FRAME {
-                        continue;
-                    }
-                    let body: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
-                    if body["cmd"] == "SET_ACTIVITY" {
-                        self.active = body["args"]["activity"].is_object();
-                    }
+                    let body = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+                    frames.push((opcode, body));
                 }
                 Ok(None) => break,
                 Err(_) => {
@@ -253,6 +315,38 @@ impl ActivityTracker {
                     self.buf = Vec::new();
                     break;
                 }
+            }
+        }
+        frames
+    }
+}
+
+/// Follows the frames a game sends to see whether it holds an activity.
+#[derive(Default)]
+pub struct ActivityTracker {
+    frames: FrameSplitter,
+    active: bool,
+}
+
+impl ActivityTracker {
+    /// Takes the next bytes from the game. Returns `Some(active)` when the
+    /// game set (`true`) or cleared (`false`) its activity.
+    pub fn feed(&mut self, bytes: &[u8]) -> Option<bool> {
+        let before = self.active;
+        for (opcode, body) in self.frames.feed(bytes) {
+            match opcode {
+                OP_HANDSHAKE => info!(
+                    "The game opened its own connection to Discord (application {})",
+                    body["client_id"].as_str().unwrap_or("unknown")
+                ),
+                OP_FRAME if body["cmd"] == "SET_ACTIVITY" => {
+                    self.active = body["args"]["activity"].is_object();
+                }
+                OP_FRAME => debug!(
+                    "Bridge: the game sent {}",
+                    body["cmd"].as_str().unwrap_or("an unknown command")
+                ),
+                _ => {}
             }
         }
         (self.active != before).then_some(self.active)
@@ -267,8 +361,35 @@ pub struct Launch {
     pub env: Vec<(OsString, OsString)>,
 }
 
-/// Starts a helper. Injectable so tests do not run anything.
-pub type Launcher = Box<dyn FnMut(&Launch) -> io::Result<Option<Child>>>;
+/// Starts and stops helper processes. A trait so that tests do not run
+/// or kill anything.
+pub trait HelperRunner {
+    fn launch(&mut self, launch: &Launch) -> io::Result<Option<Child>>;
+    /// Forcibly ends processes that did not exit when asked to.
+    fn kill(&mut self, pids: &[u32]);
+}
+
+/// The real [`HelperRunner`].
+pub struct SystemRunner;
+
+impl HelperRunner for SystemRunner {
+    fn launch(&mut self, launch: &Launch) -> io::Result<Option<Child>> {
+        spawn_helper(launch)
+    }
+
+    fn kill(&mut self, pids: &[u32]) {
+        let result = Command::new("kill")
+            .arg("-KILL")
+            .args(pids.iter().map(u32::to_string))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Err(e) = result {
+            warn!("Cannot run kill to stop a stuck bridge helper: {e}");
+        }
+    }
+}
 
 /// Works out the command that runs the helper next to a game.
 ///
@@ -367,8 +488,8 @@ fn nsenter_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("nsenter"))
 }
 
-/// The real [`Launcher`]: runs the command, detached from our terminal.
-pub fn spawn_helper(launch: &Launch) -> io::Result<Option<Child>> {
+/// Runs the helper command, detached from our terminal.
+fn spawn_helper(launch: &Launch) -> io::Result<Option<Child>> {
     Command::new(&launch.program)
         .args(&launch.args)
         .env_clear()
@@ -402,8 +523,12 @@ mod tests {
 
     /// Connects like the helper does and sends its first line.
     fn helper_connect(server: &BridgeServer, kind: char) -> TcpStream {
+        helper_connect_as(&server.launch_env(), kind)
+    }
+
+    /// Connects with the environment value of one particular launch.
+    fn helper_connect_as(value: &str, kind: char) -> TcpStream {
         let (port, token) = {
-            let value = server.env_value();
             let (port, token) = value.split_once(':').unwrap();
             (port.parse::<u16>().unwrap(), token.to_string())
         };
@@ -560,15 +685,20 @@ mod tests {
         let tmp = TempDir::new("bridge");
         let discord = FakeDiscord::start(&tmp.path().join("discord-ipc-0"));
         let server = BridgeServer::start(socket_dirs(tmp.path())).unwrap();
-        let port: u16 = server
-            .env_value()
-            .split(':')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let value = server.launch_env();
+        let port: u16 = value.split(':').next().unwrap().parse().unwrap();
+        let token = value.split_once(':').unwrap().1.split('.').next().unwrap();
+        let no_launch = format!("D {token}\n");
+        let bad_launch = format!("D {token}.x\n");
 
-        for hello in ["D wrong-token\n", "D\n", "\n", "X"] {
+        for hello in [
+            "D wrong-token.0\n",
+            &no_launch,
+            &bad_launch,
+            "D\n",
+            "\n",
+            "X",
+        ] {
             let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
             stream.write_all(hello.as_bytes()).unwrap();
             let _ = stream.write_all(&set_activity(json!({ "details": "x" })));
@@ -609,6 +739,41 @@ mod tests {
         eventually("the helper is registered", || server.helper_connected());
         drop(control);
         eventually("the helper is forgotten", || !server.helper_connected());
+    }
+
+    #[test]
+    fn a_dismissed_helper_is_turned_away_even_if_it_connects_late() {
+        let tmp = TempDir::new("bridge");
+        let discord = FakeDiscord::start(&tmp.path().join("discord-ipc-0"));
+        let server = BridgeServer::start(socket_dirs(tmp.path())).unwrap();
+
+        // Launched, but dismissed before it got round to connecting.
+        let late = server.launch_env();
+        server.disconnect_helpers();
+
+        let mut control = helper_connect_as(&late, 'C');
+        control
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(control.read_to_end(&mut rest).unwrap(), 0, "closed at once");
+        assert!(!server.helper_connected());
+
+        // Its game connections are closed too (as a reset, if what the
+        // game sent was never read) and nothing reaches Discord.
+        let mut game = helper_connect_as(&late, 'D');
+        let _ = game.write_all(&set_activity(json!({ "details": "x" })));
+        game.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        match game.read_to_end(&mut rest) {
+            Ok(n) => assert_eq!(n, 0),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+        }
+        assert_eq!(discord.try_recv(Duration::from_millis(100)), None);
+        assert!(!server.game_presence_active());
+
+        // A helper launched after the dismissal is welcome.
+        let _control = helper_connect(&server, 'C');
+        eventually("the new helper is registered", || server.helper_connected());
     }
 
     /// A fake `/proc` entry for a wineserver, plus this process's own.

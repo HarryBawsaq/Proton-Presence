@@ -13,9 +13,18 @@
  *
  *     PROTON_PRESENCE_BRIDGE=<port>:<token>
  *
- * A control connection to the daemon is kept open for the helper's whole
- * life. When it closes (the game ended or the daemon stopped) the helper
- * exits, so it can never keep a Wine prefix alive on its own.
+ * The helper must never keep a Wine prefix alive: Wine does not shut a
+ * prefix down while an ordinary program is running in it, and Steam shows
+ * the game as running until the prefix is gone. Two things guard against
+ * that:
+ *
+ * - The helper registers as a Wine "system process", like services.exe.
+ *   Wine does not wait for those; it signals them to exit as soon as the
+ *   last ordinary program has gone. If registering fails, the helper
+ *   exits at once rather than run unguarded.
+ * - A control connection to the daemon is kept open for the helper's
+ *   whole life. When it closes (the daemon dismissed the helper, or
+ *   stopped) the helper exits as well.
  *
  * Build (this is what build.sh runs):
  *   x86_64-w64-mingw32-gcc -Os -s -Wall -Wextra -Wl,--no-insert-timestamp \
@@ -156,6 +165,42 @@ stop:
     return 0;
 }
 
+/* Wine's private NtSetInformationProcess class that turns the caller into
+ * a system process. It returns an event that is signalled when the last
+ * ordinary process of the prefix has exited. */
+#define ProcessWineMakeProcessSystem 1000
+
+typedef HANDLE (__cdecl *make_system_fn)(void);
+typedef LONG (WINAPI *set_info_fn)(HANDLE, int, void *, ULONG);
+
+static HANDLE become_system_process(void)
+{
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    HANDLE event = NULL;
+    make_system_fn make_system;
+    set_info_fn set_info;
+
+    if (!ntdll)
+        return NULL;
+    /* Wine up to 7.x exported a function for this. */
+    make_system = (make_system_fn)(void *)GetProcAddress(ntdll, "__wine_make_process_system");
+    if (make_system)
+        return make_system();
+    set_info = (set_info_fn)(void *)GetProcAddress(ntdll, "NtSetInformationProcess");
+    if (set_info && set_info(GetCurrentProcess(), ProcessWineMakeProcessSystem,
+                             &event, sizeof(HANDLE *)) == 0)
+        return event;
+    return NULL;
+}
+
+/* Exits the process when Wine says the last ordinary program is gone. */
+static DWORD WINAPI watch_prefix(LPVOID arg)
+{
+    WaitForSingleObject((HANDLE)arg, INFINITE);
+    ExitProcess(0);
+    return 0;
+}
+
 /* Exits the process as soon as the daemon drops the control connection. */
 static DWORD WINAPI watch_control(LPVOID arg)
 {
@@ -172,6 +217,7 @@ int main(void)
 {
     WSADATA wsa;
     SOCKET control;
+    HANDLE prefix_idle;
     const char *config = getenv("PROTON_PRESENCE_BRIDGE");
     const char *colon = config ? strchr(config, ':') : NULL;
     BOOL first = TRUE;
@@ -182,6 +228,12 @@ int main(void)
     strcpy(daemon_token, colon + 1);
     if (daemon_port == 0 || daemon_token[0] == '\0')
         return 2;
+    prefix_idle = become_system_process();
+    if (!prefix_idle)
+        return 9;
+    if (!CreateThread(NULL, 0, watch_prefix, prefix_idle, 0, NULL))
+        return 9;
+
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
         return 3;
 
